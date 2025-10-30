@@ -128,5 +128,3 @@ app.get('/', (_req, res) => {
 app.listen(PORT, () => {
   console.log(`ScholarSync backend listening on http://localhost:${PORT}`);
 });
-
-

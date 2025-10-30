@@ -1,15 +1,10 @@
 ScholarSync: AI-Powered YouTube Study Guides
 
-This project turns any YouTube educational video into a structured study guide, complete with summaries, key concepts, and quizzes.
+This project turns any YouTube educational video into a structured study guide, complete with summaries, key concepts, and quizzes. All AI runs on-device using Chrome’s Built‑in AI APIs; there is no backend.
 
 Project Structure
 
 scholar-sync/
-├── backend/
-│   ├── node_modules/
-│   ├── .env
-│   ├── package.json
-│   └── server.js
 └── extension/
     ├── icons/
     │   ├── icon16.png
@@ -18,54 +13,33 @@ scholar-sync/
     ├── manifest.json
     ├── popup.html
     ├── popup.js
+    ├── content-script.js
     └── styles.css
 
 
-How to Run
+How to Run (Chrome Extension Only)
 
-1. Backend Setup
+1) Open Google Chrome.
+2) Go to chrome://extensions/.
+3) Enable "Developer mode" in the top-right corner.
+4) Click "Load unpacked".
+5) Select the scholar-sync/extension directory.
 
-Navigate to the backend directory:
+Usage
 
-cd backend
+1) Open a YouTube video with captions/transcript.
+2) Click the ScholarSync icon and then "Generate Study Guide".
+3) The extension locally computes:
+   - Summary (Summarizer API)
+   - Key concepts (Prompt API with JSON schema)
+   - Quiz (Prompt API with JSON schema)
+4) Secondary actions operate on selected text on the page:
+   - Rewrite (Rewriter API)
+   - Translate (Translator API)
+   - Proofread (Proofreader API)
+5) Multimodal: "Ask about frame" captures the current frame and answers your question using the Prompt API (image+text) and renders a student-friendly explanation via the Writer API.
 
+Notes
 
-Install the dependencies:
-
-npm install
-
-
-IMPORTANT: The backend server.js file is configured to use the Gemini API. The apiKey constant is left as "" to work within the specific environment this code is generated for. If you run this on your own machine, you will need to create a .env file and add your own GEMINI_API_KEY.
-
-Start the server:
-
-node server.js
-
-
-The server will be running at http://localhost:3000.
-
-2. Chrome Extension Setup
-
-Open Google Chrome.
-
-Go to chrome://extensions/.
-
-Enable "Developer mode" in the top-right corner.
-
-Click "Load unpacked".
-
-Select the scholar-sync/extension directory.
-
-The ScholarSync icon will appear in your Chrome toolbar.
-
-How to Use
-
-Navigate to any YouTube video page that has a transcript.
-
-Click the ScholarSync icon in your toolbar.
-
-Click the "Generate Study Guide" button.
-
-The extension will show a loading state, then populate the UI with the generated summary, key concepts, and an interactive quiz.
-
-You can then use the secondary buttons (Rewrite, Translate, Proofread) on the generated content.
+- Requires Chrome with Built‑in AI features enabled on your device. If an API is unavailable, the UI will show an error for that action.
+- All processing is on-device; nothing is sent to external servers.

@@ -10,6 +10,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const rewriteBtn = document.getElementById('rewrite-btn');
   const translateBtn = document.getElementById('translate-btn');
   const proofreadBtn = document.getElementById('proofread-btn');
+  const askBtn = document.getElementById('ask-btn');
+  const askWrap = document.getElementById('ask-wrap');
+  const questionInput = document.getElementById('question-input');
 
   function show(el) { el.classList.remove('hidden'); }
   function hide(el) { el.classList.add('hidden'); }
@@ -26,50 +29,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const execRes = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => {
-          function collectText(els) {
-            return Array.from(els).map(e => e.innerText?.trim()).filter(Boolean).join(' ');
-          }
-          // Old transcript layout
-          const oldEls = document.querySelectorAll('ytd-transcript-segment-renderer .segment-text');
-          if (oldEls && oldEls.length) {
-            return collectText(oldEls);
-          }
-          // New layout attempt
-          const newEls = document.querySelectorAll('yt-formatted-string.segment-text, ytd-transcript-segment-renderer #segment-text, ytd-transcript-segment-renderer yt-formatted-string');
-          if (newEls && newEls.length) {
-            return collectText(newEls);
-          }
-          // Fallback: try common transcript container text
-          const host = document.querySelector('ytd-transcript-renderer, ytd-engagement-panel-section-list-renderer');
-          return host?.innerText || '';
-        }
-      });
-
-      const transcript = execRes?.[0]?.result?.trim() || '';
+      const msgRes = await chrome.tabs.sendMessage(tab.id, { type: 'SS_GET_TRANSCRIPT' });
+      const transcript = msgRes?.transcript?.trim() || '';
       if (!transcript) {
-        setError('No transcript found. Open a YouTube video and ensure transcript is visible.');
+        const reason = msgRes?.error || 'No transcript found. Open a YouTube video and ensure transcript is visible.';
+        setError(reason);
         hide(loader);
         return;
       }
 
-      const resp = await fetch('http://localhost:3000/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript })
-      });
+      // Local on-device AI calls
+      const summary = await summarizeLocal(transcript);
+      displaySummary(summary);
 
-      if (!resp.ok) {
-        const err = await safeJson(resp);
-        throw new Error(err?.error || `API error (${resp.status})`);
-      }
+      const keyConcepts = await generateKeyConceptsLocal(transcript);
+      displayKeyConcepts(keyConcepts.map(k => `${k.term}: ${k.definition} (e.g., ${k.example})`));
 
-      const data = await resp.json();
-      displaySummary(data.summary);
-      displayKeyConcepts(data.keyConcepts || []);
-      displayQuiz(data.quiz || []);
+      const quiz = await generateQuizLocal(transcript);
+      displayQuiz(quiz.map(q => ({ question: q.question, options: q.choices, answer: String(q.choices[q.answerIndex] ?? '') })));
       show(resultsContainer);
     } catch (err) {
       console.error(err);
@@ -151,43 +128,217 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Optional secondary actions: operate on current page selection
-  async function runModify(action) {
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const execRes = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => {
-          const sel = window.getSelection();
-          return sel ? sel.toString() : '';
-        }
-      });
-      const text = execRes?.[0]?.result?.trim() || '';
-      if (!text) { setError('Select some text on the page to use this action.'); return; }
-      setError('');
-      show(loader);
-      const resp = await fetch('http://localhost:3000/api/modify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, action })
-      });
-      if (!resp.ok) {
-        const err = await safeJson(resp);
-        throw new Error(err?.error || `API error (${resp.status})`);
+  // Local secondary actions using on-device APIs on selected text
+  async function getSelectionText() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const execRes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const sel = window.getSelection();
+        return sel ? sel.toString() : '';
       }
-      const data = await resp.json();
-      await navigator.clipboard.writeText(data.modifiedText || '');
-      setError('Modified text copied to clipboard.');
-    } catch (e) {
-      setError(e?.message || 'Failed to modify text');
-    } finally {
-      hide(loader);
-    }
+    });
+    return execRes?.[0]?.result?.trim() || '';
   }
 
-  rewriteBtn?.addEventListener('click', () => runModify('rewrite'));
-  translateBtn?.addEventListener('click', () => runModify('translate'));
-  proofreadBtn?.addEventListener('click', () => runModify('proofread'));
+  async function rewriteLocal(text) {
+    if (!('ai' in window) || !window.ai?.rewriter) throw new Error('Rewriter API unavailable');
+    const rewriter = await window.ai.rewriter.create({ tone: 'concise', audience: 'student' });
+    return await rewriter.rewrite(text);
+  }
+
+  async function translateLocal(text, targetLanguage) {
+    if (!('ai' in window) || !window.ai?.translator) throw new Error('Translator API unavailable');
+    const translator = await window.ai.translator.create({ targetLanguage, detect: true });
+    return await translator.translate(text);
+  }
+
+  async function proofreadLocal(text) {
+    if (!('ai' in window) || !window.ai?.proofreader) throw new Error('Proofreader API unavailable');
+    const proofreader = await window.ai.proofreader.create({ level: 'standard' });
+    return await proofreader.proofread(text);
+  }
+
+  rewriteBtn?.addEventListener('click', async () => {
+    try {
+      setError(''); show(loader);
+      const text = await getSelectionText();
+      if (!text) throw new Error('Select some text on the page to rewrite.');
+      const out = await rewriteLocal(text);
+      await navigator.clipboard.writeText(out || '');
+      setError('Rewritten text copied to clipboard.');
+    } catch (e) {
+      setError(e?.message || 'Rewrite failed');
+    } finally { hide(loader); }
+  });
+
+  translateBtn?.addEventListener('click', async () => {
+    try {
+      setError(''); show(loader);
+      const text = await getSelectionText();
+      if (!text) throw new Error('Select some text on the page to translate.');
+      const out = await translateLocal(text, 'es');
+      await navigator.clipboard.writeText(out || '');
+      setError('Translated text copied to clipboard.');
+    } catch (e) {
+      setError(e?.message || 'Translate failed');
+    } finally { hide(loader); }
+  });
+
+  proofreadBtn?.addEventListener('click', async () => {
+    try {
+      setError(''); show(loader);
+      const text = await getSelectionText();
+      if (!text) throw new Error('Select some text on the page to proofread.');
+      const res = await proofreadLocal(text);
+      const corrected = res?.correctedText || res?.text || '';
+      await navigator.clipboard.writeText(corrected);
+      setError('Proofread text copied to clipboard.');
+    } catch (e) {
+      setError(e?.message || 'Proofread failed');
+    } finally { hide(loader); }
+  });
+
+  // Multimodal: Ask about current frame (Prompt multimodal + Writer)
+  askBtn?.addEventListener('click', async () => {
+    askWrap.classList.remove('hidden');
+    questionInput?.focus();
+  });
+
+  questionInput?.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    try {
+      setError(''); show(loader);
+      const q = questionInput.value.trim();
+      if (!q) throw new Error('Enter a question.');
+      const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
+      const blob = await (await fetch(dataUrl)).blob();
+      const analysis = await analyzeImageWithPrompt(blob, q);
+      const explanation = await writeFriendlyExplanation(analysis);
+      await navigator.clipboard.writeText(explanation);
+      setError('Answer copied to clipboard.');
+    } catch (err) {
+      setError(err?.message || 'Ask failed');
+    } finally { hide(loader); }
+  });
+
+  async function analyzeImageWithPrompt(imageBlob, question) {
+    if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+    const schema = {
+      type: 'object',
+      required: ['facts'],
+      properties: {
+        facts: { type: 'array', items: { type: 'string' }, minItems: 3 }
+      }
+    };
+    const model = await window.ai.languageModel.create({
+      systemPrompt: 'You analyze educational video frames and extract concise factual points.'
+    });
+    const result = await model.generate({
+      prompt: question,
+      input: [
+        { type: 'image', data: imageBlob },
+        { type: 'text', text: question }
+      ],
+      response: { format: 'json', schema }
+    });
+    return result.output;
+  }
+
+  async function writeFriendlyExplanation(analysis) {
+    if (!('ai' in window) || !window.ai?.writer) throw new Error('Writer API unavailable');
+    const writer = await window.ai.writer.create({ audience: 'student', tone: 'friendly' });
+    const factsList = Array.isArray(analysis?.facts) ? analysis.facts.join('\n- ') : '';
+    const prompt = `Explain these facts clearly with an analogy and 2 follow-up questions:\n- ${factsList}`;
+    return await writer.write(prompt);
+  }
+
+  // On-device main features
+  async function summarizeLocal(transcript) {
+    if (!('ai' in window)) throw new Error('On-device AI unavailable in this Chrome.');
+    if (window.ai?.summarizer) {
+      try {
+        const summarizer = await window.ai.summarizer.create({ type: 'long-form' });
+        return await summarizer.summarize(transcript);
+      } catch (e) {
+        // fall through to Prompt-based summarization
+      }
+    }
+    if (!window.ai?.languageModel) throw new Error('Summarizer API unavailable and Prompt API not available to fallback.');
+    const model = await window.ai.languageModel.create({
+      systemPrompt: 'Summarize educational transcripts clearly with bullet points and a brief overview.'
+    });
+    const result = await model.generate({
+      prompt: 'Summarize the following transcript into a short overview followed by 5-8 bullet points.',
+      input: [{ type: 'text', text: transcript }]
+    });
+    return typeof result.output === 'string' ? result.output : String(result.output);
+  }
+
+  async function generateKeyConceptsLocal(transcript) {
+    if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+    const schema = {
+      type: 'object',
+      required: ['concepts'],
+      properties: {
+        concepts: {
+          type: 'array',
+          minItems: 5,
+          items: {
+            type: 'object',
+            required: ['term', 'definition', 'example'],
+            properties: {
+              term: { type: 'string' },
+              definition: { type: 'string' },
+              example: { type: 'string' }
+            }
+          }
+        }
+      }
+    };
+    const model = await window.ai.languageModel.create({
+      systemPrompt: 'Extract concise, undergraduate-level key concepts with one-sentence definitions and examples.'
+    });
+    const result = await model.generate({
+      prompt: 'From the transcript, list key concepts with term, definition, and brief concrete example.',
+      input: [{ type: 'text', text: transcript }],
+      response: { format: 'json', schema }
+    });
+    return result.output.concepts || [];
+  }
+
+  async function generateQuizLocal(transcript) {
+    if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+    const quizSchema = {
+      type: 'object',
+      required: ['questions'],
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 5,
+          items: {
+            type: 'object',
+            required: ['question', 'choices', 'answerIndex', 'explanation'],
+            properties: {
+              question: { type: 'string' },
+              choices: { type: 'array', minItems: 4, maxItems: 4, items: { type: 'string' } },
+              answerIndex: { type: 'integer', minimum: 0, maximum: 3 },
+              explanation: { type: 'string' }
+            }
+          }
+        }
+      }
+    };
+    const model = await window.ai.languageModel.create({
+      systemPrompt: 'Write unambiguous multiple-choice quizzes (4 choices each) from transcripts.'
+    });
+    const result = await model.generate({
+      prompt: 'Create a beginner-friendly quiz from the transcript. Cover different ideas. Return only JSON.',
+      input: [{ type: 'text', text: transcript }],
+      response: { format: 'json', schema: quizSchema }
+    });
+    return result.output.questions || [];
+  }
 });
 
 
