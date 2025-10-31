@@ -21,3 +21,5 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+scholar-sync/backend/
