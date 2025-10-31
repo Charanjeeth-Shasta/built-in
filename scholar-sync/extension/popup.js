@@ -13,13 +13,54 @@ document.addEventListener('DOMContentLoaded', () => {
   const askBtn = document.getElementById('ask-btn');
   const askWrap = document.getElementById('ask-wrap');
   const questionInput = document.getElementById('question-input');
+  const secondaryOutput = document.getElementById('secondary-output');
+  const secondaryContent = document.getElementById('secondary-content');
 
-  function show(el) { el.classList.remove('hidden'); }
-  function hide(el) { el.classList.add('hidden'); }
+  function show(el) { if (el) el.classList.remove('hidden'); }
+  function hide(el) { if (el) el.classList.add('hidden'); }
   function setError(msg) {
     if (!msg) { hide(errorEl); errorEl.textContent = ''; return; }
     errorEl.textContent = msg;
     show(errorEl);
+  }
+
+  // Feature-detect APIs and pre-disable buttons if needed
+  function detectApis() {
+    // Keep buttons enabled; runtime will route calls via page main world if popup lacks APIs
+    return;
+  }
+  // Ensure initial UI state
+  hide(loader);
+  hide(errorEl);
+  hide(resultsContainer);
+  hide(secondaryOutput);
+  detectApis();
+
+  async function ensureTranscriptMessage(tabId) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, { type: 'SS_GET_TRANSCRIPT' });
+    } catch (e) {
+      // Inject content script and retry once
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content-script.js'] });
+        return await chrome.tabs.sendMessage(tabId, { type: 'SS_GET_TRANSCRIPT' });
+      } catch (e2) {
+        throw e2;
+      }
+    }
+  }
+
+  async function callBackendGenerate(transcript) {
+    const resp = await fetch('http://localhost:3000/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript })
+    });
+    if (!resp.ok) {
+      const err = await safeJson(resp);
+      throw new Error(err?.error || `Backend error ${resp.status}`);
+    }
+    return await resp.json();
   }
 
   generateBtn.addEventListener('click', async () => {
@@ -29,24 +70,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const msgRes = await chrome.tabs.sendMessage(tab.id, { type: 'SS_GET_TRANSCRIPT' });
+      const msgRes = await ensureTranscriptMessage(tab.id);
       const transcript = msgRes?.transcript?.trim() || '';
       if (!transcript) {
         const reason = msgRes?.error || 'No transcript found. Open a YouTube video and ensure transcript is visible.';
         setError(reason);
-        hide(loader);
         return;
       }
 
-      // Local on-device AI calls
-      const summary = await summarizeLocal(transcript);
-      displaySummary(summary);
-
-      const keyConcepts = await generateKeyConceptsLocal(transcript);
-      displayKeyConcepts(keyConcepts.map(k => `${k.term}: ${k.definition} (e.g., ${k.example})`));
-
-      const quiz = await generateQuizLocal(transcript);
-      displayQuiz(quiz.map(q => ({ question: q.question, options: q.choices, answer: String(q.choices[q.answerIndex] ?? '') })));
+      const data = await callBackendGenerate(transcript);
+      displaySummary(data?.summary || '');
+      displayKeyConcepts(Array.isArray(data?.keyConcepts) ? data.keyConcepts : []);
+      const quizArr = Array.isArray(data?.quiz) ? data.quiz : [];
+      displayQuiz(quizArr.map(q => ({ question: q.question, options: q.options, answer: String(q.answer || '') })));
       show(resultsContainer);
     } catch (err) {
       console.error(err);
@@ -55,6 +91,139 @@ document.addEventListener('DOMContentLoaded', () => {
       hide(loader);
     }
   });
+  async function getActiveTabId() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab?.id;
+  }
+
+  async function runInPageAi(op, payload) {
+    const tabId = await getActiveTabId();
+    if (!tabId) throw new Error('No active tab');
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: (operation, data) => {
+        async function withPromptFallbackSummarize(text) {
+          if (!('ai' in window)) throw new Error('On-device AI unavailable');
+          if (window.ai?.summarizer) {
+            try {
+              const summarizer = await window.ai.summarizer.create({ type: 'long-form' });
+              return await summarizer.summarize(text);
+            } catch {}
+          }
+          if (!window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const model = await window.ai.languageModel.create({
+            systemPrompt: 'Summarize educational transcripts clearly with bullet points and a brief overview.'
+          });
+          const result = await model.generate({
+            prompt: 'Summarize the following transcript into a short overview followed by 5-8 bullet points.',
+            input: [{ type: 'text', text }]
+          });
+          return typeof result.output === 'string' ? result.output : String(result.output);
+        }
+
+        async function concepts(text) {
+          if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const schema = {
+            type: 'object',
+            required: ['concepts'],
+            properties: { concepts: { type: 'array', minItems: 5, items: { type: 'object', required: ['term','definition','example'], properties: { term: {type:'string'}, definition:{type:'string'}, example:{type:'string'} } } } }
+          };
+          const model = await window.ai.languageModel.create({
+            systemPrompt: 'Extract concise, undergraduate-level key concepts with one-sentence definitions and examples.'
+          });
+          const res = await model.generate({
+            prompt: 'From the transcript, list key concepts with term, definition, and brief concrete example.',
+            input: [{ type: 'text', text }],
+            response: { format: 'json', schema }
+          });
+          return res.output || {};
+        }
+
+        async function quiz(text) {
+          if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const schema = {
+            type: 'object', required: ['questions'], properties: { questions: { type: 'array', minItems: 5, items: { type: 'object', required: ['question','choices','answerIndex','explanation'], properties: { question:{type:'string'}, choices:{type:'array', minItems:4, maxItems:4, items:{type:'string'}}, answerIndex:{type:'integer', minimum:0, maximum:3}, explanation:{type:'string'} } } } }
+          };
+          const model = await window.ai.languageModel.create({ systemPrompt: 'Write unambiguous multiple-choice quizzes (4 choices each) from transcripts.' });
+          const res = await model.generate({ prompt: 'Create a beginner-friendly quiz from the transcript. Cover different ideas. Return only JSON.', input: [{ type:'text', text }], response: { format:'json', schema } });
+          return res.output || {};
+        }
+
+        function normalizeString(out) {
+          return typeof out === 'string' ? out : (out ? String(out) : '');
+        }
+
+        async function rewrite(text) {
+          if (!('ai' in window)) throw new Error('On-device AI unavailable');
+          if (window.ai?.rewriter) {
+            try { const r = await window.ai.rewriter.create({ tone:'concise', audience:'student' }); return normalizeString(await r.rewrite(text)); } catch {}
+          }
+          if (!window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const lm = await window.ai.languageModel.create({ systemPrompt: 'Rewrite text for students: concise, clear, neutral tone.' });
+          const res = await lm.generate({ prompt: 'Rewrite the following text for clarity and concision.', input: [{ type:'text', text }] });
+          return normalizeString(res.output);
+        }
+
+        async function translate(text, lang) {
+          if (!('ai' in window)) throw new Error('On-device AI unavailable');
+          if (window.ai?.translator) {
+            try { const t = await window.ai.translator.create({ targetLanguage: lang, detect: true }); return normalizeString(await t.translate(text)); } catch {}
+          }
+          if (!window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const lm = await window.ai.languageModel.create({ systemPrompt: `Translate to ${lang}. Preserve meaning; output only translation.` });
+          const res = await lm.generate({ prompt: `Translate to ${lang} (no extra commentary):`, input: [{ type:'text', text }] });
+          return normalizeString(res.output);
+        }
+
+        async function proofread(text) {
+          if (!('ai' in window)) throw new Error('On-device AI unavailable');
+          if (window.ai?.proofreader) {
+            try { const p = await window.ai.proofreader.create({ level:'standard' }); return { correctedText: normalizeString(await p.proofread(text)) }; } catch {}
+          }
+          if (!window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const lm = await window.ai.languageModel.create({ systemPrompt: 'Proofread and correct grammar/spelling. Output only corrected text.' });
+          const res = await lm.generate({ prompt: 'Proofread and correct the following text. Output only corrected text.', input: [{ type:'text', text }] });
+          return { correctedText: normalizeString(res.output) };
+        }
+
+        async function analyzeImage(dataUrl, question) {
+          if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+          const schema = { type:'object', required:['facts'], properties:{ facts:{ type:'array', items:{ type:'string' }, minItems:3 } } };
+          const model = await window.ai.languageModel.create({ systemPrompt: 'You analyze educational video frames and extract concise factual points.' });
+          const blob = await (await fetch(dataUrl)).blob();
+          const res = await model.generate({
+            prompt: question,
+            input: [ { type:'image', data: blob }, { type:'text', text: question } ],
+            response: { format:'json', schema }
+          });
+          return res.output || {};
+        }
+
+        async function writeExplain(analysis) {
+          if (!('ai' in window) || !window.ai?.writer) throw new Error('Writer API unavailable');
+          const writer = await window.ai.writer.create({ audience: 'student', tone: 'friendly' });
+          const factsList = Array.isArray(analysis?.facts) ? analysis.facts.join('\n- ') : '';
+          const prompt = `Explain these facts clearly with an analogy and 2 follow-up questions:\n- ${factsList}`;
+          return await writer.write(prompt);
+        }
+
+        switch (operation) {
+          case 'summarize': return withPromptFallbackSummarize(data.text);
+          case 'concepts': return concepts(data.text);
+          case 'quiz': return quiz(data.text);
+          case 'rewrite': return rewrite(data.text);
+          case 'translate': return translate(data.text, data.lang || 'es');
+          case 'proofread': return proofread(data.text);
+          case 'analyzeImage': return analyzeImage(data.dataUrl, data.question);
+          case 'writeExplain': return writeExplain(data.analysis);
+          default: throw new Error('Unknown op');
+        }
+      },
+      args: [op, payload]
+    });
+    return result;
+  }
 
   async function safeJson(resp) {
     try { return await resp.json(); } catch { return null; }
@@ -141,22 +310,69 @@ document.addEventListener('DOMContentLoaded', () => {
     return execRes?.[0]?.result?.trim() || '';
   }
 
+  function normalizeString(out) {
+    return typeof out === 'string' ? out : (out ? String(out) : '');
+  }
+
   async function rewriteLocal(text) {
-    if (!('ai' in window) || !window.ai?.rewriter) throw new Error('Rewriter API unavailable');
-    const rewriter = await window.ai.rewriter.create({ tone: 'concise', audience: 'student' });
-    return await rewriter.rewrite(text);
+    if (!('ai' in window)) throw new Error('On-device AI unavailable in this Chrome.');
+    if (window.ai?.rewriter) {
+      try {
+        const rewriter = await window.ai.rewriter.create({ tone: 'concise', audience: 'student' });
+        return normalizeString(await rewriter.rewrite(text));
+      } catch {}
+    }
+    if (!window.ai?.languageModel) throw new Error('Rewriter API unavailable and Prompt API not available to fallback.');
+    const lm = await window.ai.languageModel.create({ systemPrompt: 'Rewrite text for students: concise, clear, neutral tone.' });
+    const res = await lm.generate({ prompt: 'Rewrite the following text for clarity and concision.', input: [{ type: 'text', text }] });
+    return normalizeString(res.output);
   }
 
   async function translateLocal(text, targetLanguage) {
-    if (!('ai' in window) || !window.ai?.translator) throw new Error('Translator API unavailable');
-    const translator = await window.ai.translator.create({ targetLanguage, detect: true });
-    return await translator.translate(text);
+    if (!('ai' in window)) throw new Error('On-device AI unavailable in this Chrome.');
+    if (window.ai?.translator) {
+      try {
+        const translator = await window.ai.translator.create({ targetLanguage, detect: true });
+        return normalizeString(await translator.translate(text));
+      } catch {}
+    }
+    if (!window.ai?.languageModel) throw new Error('Translator API unavailable and Prompt API not available to fallback.');
+    const lm = await window.ai.languageModel.create({ systemPrompt: `Translate to ${targetLanguage}. Preserve meaning; output only translation.` });
+    const res = await lm.generate({ prompt: `Translate to ${targetLanguage} (no extra commentary):`, input: [{ type: 'text', text }] });
+    return normalizeString(res.output);
   }
 
   async function proofreadLocal(text) {
-    if (!('ai' in window) || !window.ai?.proofreader) throw new Error('Proofreader API unavailable');
-    const proofreader = await window.ai.proofreader.create({ level: 'standard' });
-    return await proofreader.proofread(text);
+    if (!('ai' in window)) throw new Error('On-device AI unavailable in this Chrome.');
+    if (window.ai?.proofreader) {
+      try {
+        const proofreader = await window.ai.proofreader.create({ level: 'standard' });
+        return { correctedText: normalizeString(await proofreader.proofread(text)) };
+      } catch {}
+    }
+    if (!window.ai?.languageModel) throw new Error('Proofreader API unavailable and Prompt API not available to fallback.');
+    const lm = await window.ai.languageModel.create({ systemPrompt: 'Proofread and correct grammar/spelling. Output only corrected text.' });
+    const res = await lm.generate({ prompt: 'Proofread and correct the following text. Output only corrected text.', input: [{ type: 'text', text }] });
+    return { correctedText: normalizeString(res.output) };
+  }
+
+  function showSecondaryOutput(text) {
+    secondaryContent.textContent = text || '';
+    show(secondaryOutput);
+  }
+
+  async function callBackendModify(action, text) {
+    const resp = await fetch('http://localhost:3000/api/modify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, text })
+    });
+    if (!resp.ok) {
+      const err = await safeJson(resp);
+      throw new Error(err?.error || `Backend error ${resp.status}`);
+    }
+    const json = await resp.json();
+    return normalizeString(json?.modifiedText);
   }
 
   rewriteBtn?.addEventListener('click', async () => {
@@ -164,9 +380,8 @@ document.addEventListener('DOMContentLoaded', () => {
       setError(''); show(loader);
       const text = await getSelectionText();
       if (!text) throw new Error('Select some text on the page to rewrite.');
-      const out = await rewriteLocal(text);
-      await navigator.clipboard.writeText(out || '');
-      setError('Rewritten text copied to clipboard.');
+      const out = await callBackendModify('rewrite', text);
+      showSecondaryOutput(out);
     } catch (e) {
       setError(e?.message || 'Rewrite failed');
     } finally { hide(loader); }
@@ -177,9 +392,8 @@ document.addEventListener('DOMContentLoaded', () => {
       setError(''); show(loader);
       const text = await getSelectionText();
       if (!text) throw new Error('Select some text on the page to translate.');
-      const out = await translateLocal(text, 'es');
-      await navigator.clipboard.writeText(out || '');
-      setError('Translated text copied to clipboard.');
+      const out = await callBackendModify('translate', text);
+      showSecondaryOutput(out);
     } catch (e) {
       setError(e?.message || 'Translate failed');
     } finally { hide(loader); }
@@ -190,10 +404,8 @@ document.addEventListener('DOMContentLoaded', () => {
       setError(''); show(loader);
       const text = await getSelectionText();
       if (!text) throw new Error('Select some text on the page to proofread.');
-      const res = await proofreadLocal(text);
-      const corrected = res?.correctedText || res?.text || '';
-      await navigator.clipboard.writeText(corrected);
-      setError('Proofread text copied to clipboard.');
+      const corrected = await callBackendModify('proofread', text);
+      showSecondaryOutput(corrected);
     } catch (e) {
       setError(e?.message || 'Proofread failed');
     } finally { hide(loader); }
@@ -212,11 +424,19 @@ document.addEventListener('DOMContentLoaded', () => {
       const q = questionInput.value.trim();
       if (!q) throw new Error('Enter a question.');
       const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
-      const blob = await (await fetch(dataUrl)).blob();
-      const analysis = await analyzeImageWithPrompt(blob, q);
-      const explanation = await writeFriendlyExplanation(analysis);
-      await navigator.clipboard.writeText(explanation);
-      setError('Answer copied to clipboard.');
+      let analysis, explanation;
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        analysis = await analyzeImageWithPrompt(blob, q);
+      } catch {
+        analysis = await runInPageAi('analyzeImage', { dataUrl, question: q });
+      }
+      try {
+        explanation = await writeFriendlyExplanation(analysis);
+      } catch {
+        explanation = await runInPageAi('writeExplain', { analysis });
+      }
+      showSecondaryOutput(normalizeString(explanation));
     } catch (err) {
       setError(err?.message || 'Ask failed');
     } finally { hide(loader); }
@@ -255,7 +475,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // On-device main features
   async function summarizeLocal(transcript) {
-    if (!('ai' in window)) throw new Error('On-device AI unavailable in this Chrome.');
+    if (!('ai' in window)) {
+      // Run in page main world where AI may be exposed even if popup lacks it
+      const out = await runInPageAi('summarize', { text: transcript });
+      return out;
+    }
     if (window.ai?.summarizer) {
       try {
         const summarizer = await window.ai.summarizer.create({ type: 'long-form' });
@@ -276,7 +500,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function generateKeyConceptsLocal(transcript) {
-    if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+    if (!('ai' in window) || !window.ai?.languageModel) {
+      const out = await runInPageAi('concepts', { text: transcript });
+      return out?.concepts || [];
+    }
     const schema = {
       type: 'object',
       required: ['concepts'],
@@ -304,11 +531,19 @@ document.addEventListener('DOMContentLoaded', () => {
       input: [{ type: 'text', text: transcript }],
       response: { format: 'json', schema }
     });
-    return result.output.concepts || [];
+    const out = result?.output;
+    if (out?.concepts) return out.concepts;
+    if (typeof out === 'string') {
+      try { const parsed = JSON.parse(out); return parsed?.concepts || []; } catch {}
+    }
+    return [];
   }
 
   async function generateQuizLocal(transcript) {
-    if (!('ai' in window) || !window.ai?.languageModel) throw new Error('Prompt API unavailable');
+    if (!('ai' in window) || !window.ai?.languageModel) {
+      const out = await runInPageAi('quiz', { text: transcript });
+      return out?.questions || [];
+    }
     const quizSchema = {
       type: 'object',
       required: ['questions'],
@@ -337,7 +572,12 @@ document.addEventListener('DOMContentLoaded', () => {
       input: [{ type: 'text', text: transcript }],
       response: { format: 'json', schema: quizSchema }
     });
-    return result.output.questions || [];
+    const out = result?.output;
+    if (out?.questions) return out.questions;
+    if (typeof out === 'string') {
+      try { const parsed = JSON.parse(out); return parsed?.questions || []; } catch {}
+    }
+    return [];
   }
 });
 
