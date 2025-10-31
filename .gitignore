@@ -1,0 +1,23 @@
+# Environment files
+.env
+**/.env
+.env.local
+*.env
+*.env.*
+
+# Node
+node_modules/
+**/node_modules/
+
+# Build outputs
+build/
+dist/
+.out/
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
